@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 import zipfile
 
 import numpy as np
@@ -384,7 +385,18 @@ def build_bundle(plan_dir, output_root, sources, input_digest, attribution):
         for digest, data in payloads.items():
             (stage / "blobs" / (digest + ".npz")).write_bytes(data)
         (stage / "manifest.json").write_bytes(canonical(manifest))
-        os.rename(stage, output_root)
+        # Windows: a scanner (Defender, search indexer) can hold a just-written
+        # file open for tens of ms; os.rename of the staged dir then raises
+        # PermissionError transiently. Bounded retries absorb it; a persistent
+        # error still surfaces to the caller.
+        for attempt in range(6):
+            try:
+                os.rename(stage, output_root)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     return manifest
 
 
