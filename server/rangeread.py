@@ -32,6 +32,7 @@ import re
 import threading
 from collections import OrderedDict
 
+import blocklane
 import netfetch
 import staging
 import xproc
@@ -145,7 +146,17 @@ class RemoteFile:
         self.size = self._saved_size() if size is None else int(size)
         self._inflight = {}                 # block index -> threading.Event
         self._lock = threading.Lock()
-        self.stats = {"requests": 0, "net_bytes": 0, "disk_blocks": 0, "mem_blocks": 0}
+        self._sh = None                     # lazy: created on the first shared-tier read/write
+        self.stats = {"requests": 0, "net_bytes": 0, "disk_blocks": 0, "mem_blocks": 0,
+                      "shared_blocks": 0, "shared_written": 0}
+
+    def _shared(self):
+        """The cross-process block store for this cache_dir (blocklane): None when the tier is off
+        or failed to map — then reads miss and writes drop, per the degradation contract."""
+        if self._sh is None and os.environ.get("BNGE_SHARED_MEM", "on") != "off":
+            sh = blocklane.store_for(self.cache_dir, slot_bytes=self.block)
+            self._sh = sh if sh.ok else False
+        return self._sh or None
 
     # --- blocks ----------------------------------------------------------------------------------
     def _path(self, i):
@@ -179,6 +190,16 @@ class RemoteFile:
             with self._lock:
                 self.stats["mem_blocks"] += 1
             return b
+        # the cross-process lane: a block another of the server's processes has fetched and kept
+        # in the shared store (docs/blocklane-contract.md); a miss or torn slot costs nothing
+        sh = self._shared()
+        if sh is not None:
+            b = sh.read(blocklane.key_of(self.cache_dir), i)
+            if b is not None and len(b) == (self._block_len(i) if self.size is not None else self.block):
+                with self._lock:
+                    self.stats["shared_blocks"] = self.stats.get("shared_blocks", 0) + 1
+                self._remember(i, b)
+                return b
         try:
             with open(self._path(i), "rb") as f:
                 b = f.read()
@@ -202,6 +223,11 @@ class RemoteFile:
     def _store(self, i, b):
         self._write(self._path(i), b)
         self._remember(i, b)
+        sh = self._shared()
+        if sh is not None:
+            sh.write(blocklane.key_of(self.cache_dir), i, b)
+            with self._lock:
+                self.stats["shared_written"] += 1
 
     def _fetch_runs(self, runs, kind):
         """{i: bytes} of the runs [(i0, i1)]: one alone here, several at once (PAR_BLOCKS). A failed one's error is
