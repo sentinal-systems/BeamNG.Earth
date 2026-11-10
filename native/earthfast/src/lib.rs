@@ -316,6 +316,28 @@ fn bc1_encode_gpu<'py>(py: Python<'py>, imgs: Vec<PyReadonlyArray3<'py, u8>>) ->
     Ok(out.iter().map(|b| PyBytes::new(py, b)).collect())
 }
 
+/// src (h, w) float32 resampled to (oh, ow) on the GPU (gpu.rs resample): out (x, y) bilinear-samples src at
+/// (a*x + b*y + c, d*x + e*y + f) for x = x+0.5, y = y+0.5 — PIL "F" bilinear semantics, the map-coordinates
+/// pattern of DEM/imagery resampling. RuntimeError: no GPU or it failed.
+#[pyfunction]
+fn resample_bilinear_gpu<'py>(py: Python<'py>, src: PyReadonlyArray2<'py, f32>, fwd: Vec<f64>,
+                              oh: usize, ow: usize) -> PyResult<Bound<'py, numpy::PyArray2<f32>>> {
+    if fwd.len() != 6 {
+        return Err(pyo3::exceptions::PyValueError::new_err("resample_bilinear_gpu: fwd needs 6 coefficients"));
+    }
+    let v = src.as_array();
+    let (h, w) = (v.shape()[0], v.shape()[1]);
+    let data: Vec<f32> = v.iter().copied().collect();
+    let fwd6: [f64; 6] = fwd[..6].try_into().unwrap();
+    let out = py.allow_threads(|| {
+        let g = gpu::get().ok_or_else(|| "no GPU".to_string())?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gpu::resample_bilinear(g, &data, h, w, &fwd6, oh, ow)
+        })).unwrap_or_else(|_| Err("the GPU kernel panicked".to_string()))
+    }).map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+    Ok(numpy::ndarray::Array2::from_shape_vec((oh, ow), out).unwrap().into_pyarray(py))
+}
+
 /// BC7 (mode 6) blocks of several RGBA images (a texture's mip levels: [(h, w, 4) uint8]) on the GPU (gpu.rs): one
 /// bytes object per image, as bc7_encode's (float32 maths: a few blocks can differ from it). RuntimeError: no GPU or
 /// it failed.
@@ -5314,6 +5336,7 @@ fn earthfast(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(junctionsnap::snap_junctions, m)?)?;
     m.add_function(wrap_pyfunction!(junctionsnap::hold_junction_corridors, m)?)?;
     m.add_function(wrap_pyfunction!(bc7_encode_gpu, m)?)?;
+    m.add_function(wrap_pyfunction!(resample_bilinear_gpu, m)?)?;
     m.add_function(wrap_pyfunction!(tunnelcover::tunnel_cover_roads, m)?)?;
     m.add_function(wrap_pyfunction!(tunnelcover::tunnel_reach, m)?)?;
     m.add_function(wrap_pyfunction!(gradesep::gradesep_candidates, m)?)?;

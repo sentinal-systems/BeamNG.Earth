@@ -797,3 +797,134 @@ fn bc7_pipe(gpu: &Gpu) -> &'static Bc7Pipe {
         Bc7Pipe { layout, pipe }
     })
 }
+
+// --- bilinear resample -------------------------------------------------------------------------------------------
+
+const RESAMPLE_WGSL: &str = r#"
+struct RP {
+    w: u32, h: u32, ow: u32, oh: u32,
+    fa: f32, fb: f32, fc: f32, fd: f32, fe: f32, ff: f32,
+};
+@group(0) @binding(0) var<uniform> p: RP;
+@group(0) @binding(1) var<storage, read> src: array<f32>;            // h x w
+@group(0) @binding(2) var<storage, read_write> dst: array<f32>;      // oh x ow
+
+// the same bilinear as pil_bilinear above (PIL "F" semantics: 0 outside, edges clamped, next row only when in)
+fn r_bilinear(xin: f32, yin: f32) -> f32 {
+    if (xin < 0.0 || xin >= f32(p.w) || yin < 0.0 || yin >= f32(p.h)) { return 0.0; }
+    let x = xin - 0.5; let y = yin - 0.5;
+    let xf = floor(x); let yf = floor(y);
+    let dx = x - xf; let dy = y - yf;
+    let xi = i32(xf); let yi = i32(yf);
+    let x0 = clamp(xi, 0, i32(p.w) - 1); let x1 = clamp(xi + 1, 0, i32(p.w) - 1);
+    let y0 = clamp(yi, 0, i32(p.h) - 1);
+    let W = p.w;
+    let a0 = src[u32(y0) * W + u32(x0)]; let a1 = src[u32(y0) * W + u32(x1)];
+    let v1 = a0 + (a1 - a0) * dx;
+    var v2 = v1;
+    if (yi + 1 >= 0 && yi + 1 < i32(p.h)) {
+        let b0 = src[u32(yi + 1) * W + u32(x0)]; let b1 = src[u32(yi + 1) * W + u32(x1)];
+        v2 = b0 + (b1 - b0) * dx;
+    }
+    return v1 + (v2 - v1) * dy;
+}
+
+@compute @workgroup_size(16, 16)
+fn resample(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= p.ow || g.y >= p.oh) { return; }
+    let x = f32(g.x) + 0.5; let y = f32(g.y) + 0.5;
+    let xs = p.fa * x + p.fb * y + p.fc;
+    let ys = p.fd * x + p.fe * y + p.ff;
+    dst[g.y * p.ow + g.x] = r_bilinear(xs, ys);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ResampleParams {
+    w: u32, h: u32, ow: u32, oh: u32,
+    fa: f32, fb: f32, fc: f32, fd: f32, fe: f32, ff: f32,
+}
+
+/// src (h, w) f32 resampled to (oh, ow) by the affine fwd = [a, b, c, d, e, f]: out pixel (x, y)
+/// samples src at (a*x + b*y + c, d*x + e*y + f) for x = out_x + 0.5, y = out_y + 0.5 — the same
+/// affine->bilinear the seam rotate kernel runs, generalised to one channel (a DEM / imagery
+/// resample: the numpy map-coordinates path it replaces runs ~1-4 s per block on the workers).
+/// Returns flat oh*ow f32, or an error string.
+pub fn resample_bilinear(gpu: &Gpu, src: &[f32], h: usize, w: usize, fwd: &[f64; 6],
+                        oh: usize, ow: usize) -> Result<Vec<f32>, String> {
+    if src.len() != h * w || oh == 0 || ow == 0 {
+        return Err("resample_bilinear: bad arguments".into());
+    }
+    let d = &gpu.device;
+    let module = d.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("resample"), source: wgpu::ShaderSource::Wgsl(RESAMPLE_WGSL.into()),
+    });
+    let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+        binding, visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    };
+    let layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[entry(0, wgpu::BufferBindingType::Uniform),
+                   entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
+                   entry(2, wgpu::BufferBindingType::Storage { read_only: false })],
+    });
+    let pl = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[],
+    });
+    let pipe = d.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("resample"), layout: Some(&pl), module: &module, entry_point: Some("resample"),
+        compilation_options: Default::default(), cache: None,
+    });
+    let st = wgpu::BufferUsages::STORAGE;
+    let srcb = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("src"), contents: bytemuck::cast_slice(src), usage: st,
+    });
+    let n_out = oh * ow;
+    let outb = d.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("out"), size: (n_out * 4) as u64,
+        usage: st | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false,
+    });
+    let pbuf = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("params"), usage: wgpu::BufferUsages::UNIFORM,
+        contents: bytemuck::bytes_of(&ResampleParams {
+            w: w as u32, h: h as u32, ow: ow as u32, oh: oh as u32,
+            fa: fwd[0] as f32, fb: fwd[1] as f32, fc: fwd[2] as f32,
+            fd: fwd[3] as f32, fe: fwd[4] as f32, ff: fwd[5] as f32,
+        }),
+    });
+    let bg = d.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &layout,
+        entries: &[&pbuf, &srcb, &outb].iter().enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
+            .collect::<Vec<_>>(),
+    });
+    let mut enc = d.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None, timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipe);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(ow.div_ceil(16) as u32, oh.div_ceil(16) as u32, 1);
+    }
+    let sub = gpu.queue.submit(Some(enc.finish()));
+    d.poll(wgpu::PollType::WaitForSubmissionIndex(sub)).map_err(|e| format!("poll: {e:?}"))?;
+    let rb = d.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"), size: (n_out * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let mut enc = d.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    enc.copy_buffer_to_buffer(&outb, 0, &rb, 0, (n_out * 4) as u64);
+    gpu.queue.submit(Some(enc.finish()));
+    let slice = rb.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+    d.poll(wgpu::PollType::Wait).map_err(|e| format!("poll: {e:?}"))?;
+    rx.recv().map_err(|e| format!("map: {e}"))?.map_err(|e| format!("map: {e:?}"))?;
+    let out = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
+    rb.unmap();
+    Ok(out)
+}
