@@ -16,8 +16,10 @@ existing transport (the socket), matching 'never a reason to fail a download'. A
 frame start; the producer's seq bump happens only after the whole frame landed, so readers can
 never see a half frame: write_seq is the commit point.
 
-Layout:
-    header   8B magic "BNGErng1", 8B capacity, 8B write_seq, 8B read_seq, 8B reserved
+Layout (SRNG v1 — the shared stream-ring contract):
+    header   8B magic "SRNGv001", 8B capacity, 8B write_seq, 8B read_seq,
+             8B producer_pid, 8B consumer_pid, 8B flags, 8B reserved,
+             16×8B pad  (= 192B)
     frames   [u32 len][payload]...  (a u32 len of 0 at a frame position = wrapped: skip to 0)
 
 Windows: named mapping (tagname) as blocklane does; POSIX: a named file under the cache dir.
@@ -28,12 +30,15 @@ import struct
 import sys
 import time
 
-MAGIC = b"BNGErng1"
-HDR = struct.Struct("<8sQQQQ")                    # magic, capacity, write_seq, read_seq, reserved
+MAGIC = b"SRNGv001"
+HDR = struct.Struct("<8s" + "Q" * 23)             # magic + 23 u64 fields = 192B header
 LEN = struct.Struct("<I")
 WSEQ_OFF = 16                                     # header field offsets (magic+capacity first)
 RSEQ_OFF = 24
-HDR_SZ = HDR.size
+PPID_OFF = 32
+CPID_OFF = 40
+FLAGS_OFF = 48
+HDR_SZ = HDR.size                                 # 192 — frames start here
 FRAME_CAP = 64 * 1024 * 1024                      # bytes of frame space (env BNGE_RING_BYTES)
 
 _channels = {}                                    # name -> _Ring
@@ -64,9 +69,14 @@ class _Ring:
                     self.mm = mmap.mmap(fd, size)
                 finally:
                     os.close(fd)
-            magic, cap, _w, _r, _ = HDR.unpack(self.mm[:HDR_SZ])
+            magic, cap = HDR.unpack_from(self.mm, 0)[:2]
             if magic != MAGIC or cap != self.capacity:
-                self.mm[:HDR_SZ] = HDR.pack(MAGIC, self.capacity, 0, 0, 0)
+                # fresh or foreign region: lay out v1, seqs/pids start zero
+                self.mm[:HDR_SZ] = HDR.pack(MAGIC, self.capacity, *([0] * 22))
+                struct.pack_into("<Q", self.mm, PPID_OFF, os.getpid())
+            else:
+                # adopted an existing v1 ring — record ourselves as the reader
+                struct.pack_into("<Q", self.mm, CPID_OFF, os.getpid())
             self.ok = True
         except (OSError, ValueError, BufferError):
             self.ok = False
